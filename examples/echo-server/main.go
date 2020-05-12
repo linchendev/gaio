@@ -4,7 +4,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/xtaci/gaio"
+	"github.com/linchendev/gaio"
 )
 
 // this goroutine will wait for all io events, and sents back everything it received
