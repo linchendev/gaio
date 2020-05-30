@@ -10,6 +10,7 @@ import (
 	"container/heap"
 	"container/list"
 	"io"
+	"log"
 	"net"
 	"reflect"
 	"runtime"
@@ -36,6 +37,9 @@ type watcher struct {
 	// events from user
 	chPendingNotify chan struct{}
 
+	// broadcast
+	chBroadcastNotify chan struct{}
+
 	// IO-completion events to user
 	chNotifyCompletion chan struct{}
 	hangup             chan struct{} // blocking delivery will hangup on this
@@ -47,6 +51,10 @@ type watcher struct {
 	// aiocb is associated to fd
 	pending      []*aiocb
 	pendingMutex sync.Mutex
+
+	// lock for broadcast io operations
+	broadcast      []*aiocb
+	broadcastMutex sync.Mutex
 
 	// internal buffer for reading
 	swapSize      int // swap buffer capacity
@@ -75,6 +83,7 @@ type watcher struct {
 // NewWatcher creates a management object for monitoring file descriptors
 // with default internal buffer size - 64KB
 func NewWatcher() (*Watcher, error) {
+	log.Println("new watcher")
 	return NewWatcherSize(defaultInternalBufferSize)
 }
 
@@ -92,6 +101,7 @@ func NewWatcherSize(bufsize int) (*Watcher, error) {
 	// loop related chan
 	w.chEventNotify = make(chan pollerEvents, eventQueueSize)
 	w.chPendingNotify = make(chan struct{}, 1)
+	w.chBroadcastNotify = make(chan struct{}, 1)
 	w.chNotifyCompletion = make(chan struct{}, 1)
 	w.die = make(chan struct{})
 
@@ -136,6 +146,13 @@ func (w *watcher) Close() (err error) {
 func (w *watcher) notifyPending() {
 	select {
 	case w.chPendingNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (w *watcher) notifyBroadcast() {
+	select {
+	case w.chBroadcastNotify <- struct{}{}:
 	default:
 	}
 }
@@ -198,7 +215,15 @@ func (w *watcher) Write(ctx interface{}, conn net.Conn, buf []byte) error {
 	if len(buf) == 0 {
 		return ErrEmptyBuffer
 	}
+	log.Println("write:", buf)
 	return w.aioCreate(ctx, OpWrite, conn, buf, zeroTime, false)
+}
+
+func (w *watcher) Broadcast(ctx interface{}, buf []byte) error {
+	if len(buf) == 0 {
+		return ErrEmptyBuffer
+	}
+	return w.aioBroadcast(ctx, buf, zeroTime)
 }
 
 // WriteTimeout submits an async write request on 'fd' with context 'ctx', using buffer 'buf', and
@@ -214,6 +239,7 @@ func (w *watcher) WriteTimeout(ctx interface{}, conn net.Conn, buf []byte, deadl
 // Free let the watcher to release resources related to this conn immediately,
 // like socket file descriptors.
 func (w *watcher) Free(conn net.Conn) error {
+	log.Println("free conn:", conn)
 	return w.aioCreate(nil, opDelete, conn, nil, zeroTime, false)
 }
 
@@ -234,6 +260,22 @@ func (w *watcher) aioCreate(ctx interface{}, op OpType, conn net.Conn, buf []byt
 		w.pendingMutex.Unlock()
 
 		w.notifyPending()
+		log.Println("aio create:", op)
+		return nil
+	}
+}
+
+//broadcast
+func (w *watcher) aioBroadcast(ctx interface{}, buf []byte, deadline time.Time) error {
+	select {
+	case <-w.die:
+		return ErrWatcherClosed
+	default:
+		w.broadcastMutex.Lock()
+		w.broadcast = append(w.broadcast, &aiocb{ctx: ctx, buffer: buf, deadline: deadline})
+		w.broadcastMutex.Unlock()
+
+		w.notifyBroadcast()
 		return nil
 	}
 }
@@ -248,11 +290,13 @@ func (w *watcher) tryRead(fd int, pcb *aiocb) bool {
 		useSwap = true
 	}
 
+	log.Println("tryRead start:", fd)
+
 	for {
 		// return values are stored in pcb
 		nr, er := syscall.Read(fd, buf[pcb.size:])
 		pcb.err = er
-		if er == syscall.EAGAIN {
+		if er == syscall.EAGAIN { //上层不删除，等下次循环再尝试！
 			return false
 		}
 
@@ -262,25 +306,28 @@ func (w *watcher) tryRead(fd int, pcb *aiocb) bool {
 			continue
 		}
 
-		// if er is nil, accumulate bytes read
+		// if er is nil, accumulate bytes read //原来这个单词是累加的意思啊
 		if er == nil {
 			pcb.size += nr
 		}
 
-		// proper setting of EOF
+		// proper setting of EOF	//对方断开了，这里是不是要用定时器。客户端断开的时候会调用到这里
 		if nr == 0 && er == nil {
 			pcb.err = io.EOF
+			log.Println("fd EOF:", fd)
 		}
 
 		break
 	}
 
+	log.Println("tryRead end:", fd)
+
 	completed := false
 	if pcb.err != nil {
 		completed = true
-	} else if pcb.size == len(pcb.buffer) {
+	} else if pcb.size == len(pcb.buffer) { //需要读满buff
 		completed = true
-	} else if !pcb.readFull {
+	} else if !pcb.readFull { //读一次就完成
 		completed = true
 	}
 
@@ -337,6 +384,7 @@ func (w *watcher) tryWrite(fd int, pcb *aiocb) bool {
 
 // release connection related resources
 func (w *watcher) releaseConn(ident int) {
+	log.Println("release conn:", ident, len(w.descs))
 	if desc, ok := w.descs[ident]; ok {
 		// delete from heap
 		for e := desc.readers.Front(); e != nil; e = e.Next() {
@@ -364,7 +412,7 @@ func (w *watcher) releaseConn(ident int) {
 func (w *watcher) deliver(pcb *aiocb) {
 	var hangup chan struct{}
 	w.resultsMutex.Lock()
-	w.results[w.resultsIdx] = append(w.results[w.resultsIdx], OpResult{Operation: pcb.op, Conn: pcb.conn, IsSwapBuffer: pcb.useSwap, Buffer: pcb.buffer, Size: pcb.size, Error: pcb.err, Context: pcb.ctx})
+	w.results[w.resultsIdx] = append(w.results[w.resultsIdx], OpResult{Operation: pcb.op, Conn: pcb.conn, IsSwapBuffer: pcb.useSwap, Buffer: pcb.buffer, Size: pcb.size, Error: pcb.err, Context: pcb.ctx, Ident: w.connIdents[pcb.ptr]})
 	if pcb.notifyCaller {
 		hangup = make(chan struct{})
 		w.hangup = hangup
@@ -397,7 +445,7 @@ func (w *watcher) loop() {
 		}
 	}()
 
-	var pending []*aiocb
+	var pending, broadcast []*aiocb
 	for {
 		select {
 		case <-w.chPendingNotify:
@@ -407,15 +455,29 @@ func (w *watcher) loop() {
 				pending = make([]*aiocb, 0, cap(w.pending))
 			}
 			pending = pending[:len(w.pending)]
+			log.Println("loop pending notify:", len(pending))
 			copy(pending, w.pending)
 			w.pending = w.pending[:0]
 			w.pendingMutex.Unlock()
 			w.handlePending(pending)
+		case <-w.chBroadcastNotify:
+			w.broadcastMutex.Lock()
+			if cap(broadcast) < cap(w.broadcast) {
+				broadcast = make([]*aiocb, 0, cap(w.broadcast))
+			}
+			broadcast = broadcast[:len(w.broadcast)]
+			log.Println("loop broadcast notify:", len(broadcast))
+			copy(broadcast, w.broadcast)
+			w.broadcast = w.broadcast[:0]
+			w.broadcastMutex.Unlock()
+			w.handleBroadcast(broadcast)
 
 		case pe := <-w.chEventNotify: // poller events
+			log.Println("loop event notify:", pe)
 			w.handleEvents(pe)
 
 		case <-w.timer.C: // timeout heap
+			log.Println("loop time tick:", len(w.descs), w.timeouts.Len())
 			for w.timeouts.Len() > 0 {
 				now := time.Now()
 				pcb := w.timeouts[0]
@@ -433,6 +495,7 @@ func (w *watcher) loop() {
 			}
 
 		case <-w.gcNotify: // gc recycled net.Conn
+			log.Println("loop gc notify:", len(w.descs), len(w.gc))
 			w.gcMutex.Lock()
 			for i, c := range w.gc {
 				ptr := reflect.ValueOf(c).Pointer()
@@ -462,16 +525,20 @@ func (w *watcher) handlePending(pending []*aiocb) {
 			continue
 		}
 
+		log.Println("handlePending:", ident, pcb.ptr)
+
 		// handling new connection
 		var desc *fdDesc
 		if ok {
 			desc = w.descs[ident]
-		} else {
+		} else { //新建连接
 			if dupfd, err := dupconn(pcb.conn); err != nil {
 				pcb.err = err
 				w.deliver(pcb)
 				continue
 			} else {
+				log.Println("new connect:", ident, "dup to:", dupfd)
+
 				// as we duplicated successfully, we're safe to
 				// close the original connection
 				pcb.conn.Close()
@@ -532,13 +599,34 @@ func (w *watcher) handlePending(pending []*aiocb) {
 			pcb.elem = pcb.l.PushBack(pcb)
 		}
 
+		log.Println("pcb deadline zero:", pcb.deadline.IsZero())
 		// push to heap for timeout operation
 		if !pcb.deadline.IsZero() {
 			heap.Push(&w.timeouts, pcb)
+			log.Println("timeout len:", w.timeouts.Len())
 			if w.timeouts.Len() == 1 {
-				w.timer.Reset(pcb.deadline.Sub(time.Now()))
+				dur := pcb.deadline.Sub(time.Now())
+				w.timer.Reset(dur)
+				log.Println("timer reset:", dur)
 			}
 		}
+	}
+}
+
+func (w *watcher) handleBroadcast(broadcast []*aiocb) {
+	if len(broadcast) != 0 {
+		w.pendingMutex.Lock()
+		for _, pcb := range broadcast {
+			for _, desc := range w.descs {
+				w.pending = append(w.pending, &aiocb{
+					op: OpWrite, ptr: desc.ptr,
+					ctx: pcb.ctx, buffer: pcb.buffer,
+					deadline: pcb.deadline, readFull: pcb.readFull,
+				})
+			}
+		}
+		w.pendingMutex.Unlock()
+		w.notifyPending()
 	}
 }
 
@@ -552,8 +640,8 @@ func (w *watcher) handleEvents(pe pollerEvents) {
 	// To solve this problem watcher will dup() a new fd from net.Conn, which uniquely
 	// identified by 'e.ident', all library operation will be based on 'e.ident',
 	// then IO operation is impossible to misread or miswrite on re-created fd.
-	//log.Println(e)
 	for _, e := range pe {
+		log.Println("handle event:", e, len(w.descs))
 		if desc, ok := w.descs[e.ident]; ok {
 			if e.r {
 				var next *list.Element

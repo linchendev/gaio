@@ -47,6 +47,8 @@ const (
 	OpWrite
 	// internal operation to delete an related resource
 	opDelete
+	// broadcast operation
+	OpBroadcast
 )
 
 // event represent a file descriptor event
@@ -77,6 +79,8 @@ type OpResult struct {
 	Size int
 	// IO error,timeout error
 	Error error
+	// fd or ident
+	Ident int
 }
 
 // aiocb contains all info for a single request
@@ -95,6 +99,9 @@ type aiocb struct {
 	notifyCaller bool // mark if the caller have to wakeup caller to swap buffer.
 	idx          int  // index for heap op
 	deadline     time.Time
+	//-------------------------
+	ident     int
+	broadcast bool //广播
 }
 
 // Watcher will monitor events and process async-io request(s),
